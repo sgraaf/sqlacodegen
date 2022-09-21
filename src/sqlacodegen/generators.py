@@ -1470,3 +1470,101 @@ class SQLModelGenerator(DeclarativeGenerator):
                 rendered_args.append("sa_relationship_kwargs={'uselist': False}")
 
         return rendered_args
+
+
+class CustomGenerator(DeclarativeGenerator):
+
+    def generate_model_name(self, model: Model, global_names: set[str]) -> None:
+        if isinstance(model, ModelClass):
+            preferred_name = _re_invalid_identifier.sub("_", model.table.name)
+            preferred_name = "".join(part.title() for part in preferred_name.split("_"))
+            if "use_inflect" in self.options:
+                singular_name = self.inflect_engine.singular_noun(preferred_name)
+                if singular_name:
+                    preferred_name = singular_name
+
+            model.name = self.find_free_name(preferred_name, global_names)
+
+            # Fill in the names for column attributes
+            local_names: set[str] = set()
+            for column_attr in model.columns:
+                self.generate_column_attr_name(column_attr, global_names, local_names)
+                local_names.add(column_attr.name)
+
+            # Fill in the names for relationship attributes
+            for relationship in model.relationships:
+                self.generate_relationship_name(relationship, global_names, local_names)
+                local_names.add(relationship.name)
+        else:
+            super().generate_model_name(model, global_names)
+
+    def generate_column_attr_name(
+        self,
+        column_attr: ColumnAttribute,
+        global_names: set[str],
+        local_names: set[str],
+    ) -> None:
+        column_attr.name = self.find_free_name(column_attr.column.name.lower(), global_names, local_names)
+
+    def generate_relationship_name(
+        self,
+        relationship: RelationshipAttribute,
+        global_names: set[str],
+        local_names: set[str],
+    ) -> None:
+        # Self referential reverse relationships
+        if (
+            relationship.type
+            in (RelationshipType.ONE_TO_MANY, RelationshipType.ONE_TO_ONE)
+            and relationship.source is relationship.target
+            and relationship.backref
+            and relationship.backref.name
+        ):
+            preferred_name = relationship.backref.name + "_reverse"
+        else:
+            preferred_name = relationship.target.table.name
+
+            # If there's a constraint with a single column that ends with "_id", use the
+            # preceding part as the relationship name
+            if relationship.constraint:
+                is_source = relationship.source.table is relationship.constraint.table
+                if is_source or relationship.type not in (
+                    RelationshipType.ONE_TO_ONE,
+                    RelationshipType.ONE_TO_MANY,
+                ):
+                    column_names = [c.name for c in relationship.constraint.columns]
+                    if len(column_names) == 1 and column_names[0].endswith("_id"):
+                        preferred_name = column_names[0][:-3]
+
+            if "use_inflect" in self.options:
+                if relationship.type in (
+                    RelationshipType.ONE_TO_MANY,
+                    RelationshipType.MANY_TO_MANY,
+                ):
+                    preferred_name = self.inflect_engine.plural_noun(preferred_name)
+                else:
+                    singular_name = self.inflect_engine.singular_noun(preferred_name)
+                    if singular_name:
+                        preferred_name = singular_name
+
+        relationship.name = self.find_free_name(preferred_name.lower(), global_names, local_names)
+
+    def render_column_attribute(self, column_attr: ColumnAttribute) -> str:
+        column = column_attr.column
+        try:
+            python_type = column.type.python_type
+        except NotImplementedError:
+            python_type_name = "Any"
+        else:
+            python_type_name = python_type.__name__
+
+        if column.nullable:
+            self.add_literal_import("typing", "Optional")
+            python_type_name = f"Optional[{python_type_name}]"
+
+        # add `Mapped` to the variable type
+        self.add_literal_import("sqlalchemy.orm", "Mapped")
+        python_type_name = f"Mapped[{python_type_name}]"
+
+        rendered_column = self.render_column(column, column_attr.name != column.name)
+        return f"{column_attr.name}: {python_type_name} = {rendered_column}"
