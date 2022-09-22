@@ -15,7 +15,9 @@ from pprint import pformat
 from textwrap import indent
 from typing import Any, ClassVar
 
+import black
 import inflect
+import isort
 import sqlalchemy
 from sqlalchemy import (
     ARRAY,
@@ -1473,6 +1475,64 @@ class SQLModelGenerator(DeclarativeGenerator):
 
 
 class CustomGenerator(DeclarativeGenerator):
+
+    def generate(self) -> str:
+        sections: list[str] = []
+
+        # Remove unwanted elements from the metadata
+        for table in list(self.metadata.tables.values()):
+            if self.should_ignore_table(table):
+                self.metadata.remove(table)
+                continue
+
+            if "noindexes" in self.options:
+                table.indexes.clear()
+
+            if "noconstraints" in self.options:
+                table.constraints.clear()
+
+            if "nocomments" in self.options:
+                table.comment = None
+
+            for column in table.columns:
+                if "nocomments" in self.options:
+                    column.comment = None
+
+        # Use information from column constraints to figure out the intended column
+        # types
+        for table in self.metadata.tables.values():
+            self.fix_column_types(table)
+
+        # Generate the models
+        models: list[Model] = self.generate_models()
+
+        # Render module level variables
+        variables = self.render_module_variables(models)
+        if variables:
+            sections.append(variables + "\n")
+
+        # Render models
+        rendered_models = self.render_models(models)
+        if rendered_models:
+            sections.append(rendered_models)
+
+        # Render collected imports
+        groups = self.group_imports()
+        imports = "\n\n".join("\n".join(line for line in group) for group in groups)
+        if imports:
+            imports = isort.code(imports, profile="black").removesuffix("\n")
+            sections.insert(0, imports)
+
+        return black.format_str("\n\n".join(sections) + "\n", mode=black.FileMode())
+
+    def collect_imports_for_column(self, column: Column[Any]) -> None:
+        super().collect_imports_for_column(column)
+        try:
+            python_type = column.type.python_type
+        except NotImplementedError:
+            self.add_literal_import("typing", "Any")
+        else:
+            self.add_import(python_type)
 
     def generate_model_name(self, model: Model, global_names: set[str]) -> None:
         if isinstance(model, ModelClass):
